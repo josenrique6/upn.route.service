@@ -1,18 +1,26 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import json
-from typing import List, Dict, Any, Tuple
-from datetime import datetime, timedelta
+from datetime import timedelta
+from typing import Any
+
 import numpy as np
 import requests
 from fastapi import HTTPException
-from ortools.constraint_solver import routing_enums_pb2, pywrapcp
-from app.entities.optimizer import EtaItem, Location, RouteInfo, RouteRequest, RouteResponse, TruckResponse
-from sklearn.cluster import KMeans, DBSCAN
+from ortools.constraint_solver import pywrapcp, routing_enums_pb2
+from sklearn.cluster import DBSCAN, KMeans
+
+from app.entities.optimizer import (
+    EtaItem,
+    Location,
+    RouteInfo,
+    RouteRequest,
+    RouteResponse,
+    TruckResponse,
+)
 
 # Definimos el divisor volumétrico (kg por m³)
 FACTOR_VOLUM_TO_KG = 167.0
 
-def fetch_cost_pair(i: int, j: int, coords: List[List[float]], truck_options: Dict[str, Any], headers: Dict[str, str], route_url: str, preference: str) -> Tuple[int, int, int, int]:
+def fetch_cost_pair(i: int, j: int, coords: list[list[float]], truck_options: dict[str, Any], headers: dict[str, str], route_url: str, preference: str) -> tuple[int, int, int, int]:
     """Realiza una sola petición a ORS Directions y retorna (i, j, distancia, duración)."""
     body = {
         "preference": preference,
@@ -31,13 +39,13 @@ def fetch_cost_pair(i: int, j: int, coords: List[List[float]], truck_options: Di
     return i, j, dist, dur
 
 def build_cost_matrices(
-    coordinates: List[List[float]],
-    truck_options: Dict[str, Any],
-    headers: Dict[str, str],
+    coordinates: list[list[float]],
+    truck_options: dict[str, Any],
+    headers: dict[str, str],
     route_url: str,
     max_workers: int = 20,
     preference: str = "fastest"
-) -> Tuple[List[List[int]], List[List[int]]]:
+) -> tuple[list[list[int]], list[list[int]]]:
     """
     Construye matrices de distancia y tiempo usando llamadas paralelas a ORS Directions,
     respetando exclusiones definidas en truck_options.
@@ -60,7 +68,9 @@ def build_cost_matrices(
 
     return distance_matrix, time_matrix
 
-def optimize_route_logic(request: RouteRequest) -> Dict[str, Any]:
+def optimize_route_logic(request: RouteRequest) -> dict[str, Any]:
+    """Resuelve el VRP para todas las ubicaciones y camiones recibidos."""
+
     coordinates = [loc.coordinates for loc in request.locations]
     service_times = [loc.service_time for loc in request.locations]
     location_ids = [loc.id for loc in request.locations]
@@ -102,22 +112,8 @@ def optimize_route_logic(request: RouteRequest) -> Dict[str, Any]:
 
     # 1. Parámetros previos
     depot = request.depot_index if 0 <= request.depot_index < n else 0
-    dists_from_depot = distance_matrix[depot]
-    candidate_indices = [i for i in range(n) if i != depot]
 
-    # 2. Filtrar solo aquellos sin time_window
-    no_window_candidates = [
-    i for i in candidate_indices
-    if request.locations[i].time_window is None
-    ]    
-
-    # 3. Decidir el farthest definitivo
-    if no_window_candidates:
-        # Elige el más lejano entre los que no tienen ventana
-        farthest = max(no_window_candidates, key=lambda i: dists_from_depot[i])
-    else:
-        # Si todos tienen ventana, vuelve a tu lógica original
-        farthest = max(candidate_indices, key=lambda i: dists_from_depot[i])
+    # 2. Filtrar solo aquellos sin time_window (reservado para futuras mejoras)
 
     osm_speed_profiles = {
         "motorway": 45,
@@ -181,7 +177,7 @@ def optimize_route_logic(request: RouteRequest) -> Dict[str, Any]:
     # Lista de penalidades por nodo
     penalties = [int(prio_map[loc.priority] * PENALTY_FACTOR)
                  for loc in request.locations]
-    
+
     # Construimos la matriz (n×n) de tiempo penalizado
     n = len(request.locations)
     time_prio_matrix = [[0]*n for _ in range(n)]
@@ -197,7 +193,7 @@ def optimize_route_logic(request: RouteRequest) -> Dict[str, Any]:
     def time_prio_lookup(from_index: int, to_index: int) -> int:
         i = manager.IndexToNode(from_index)
         j = manager.IndexToNode(to_index)
-        return time_prio_matrix[i][j]                
+        return time_prio_matrix[i][j]
 
     def adjusted_time_callback(from_index: int, to_index: int) -> int:
         # Índices de OR-Tools → índices de nodo
@@ -209,7 +205,7 @@ def optimize_route_logic(request: RouteRequest) -> Dict[str, Any]:
 
     def distance_callback(from_index, to_index):
         return distance_matrix[manager.IndexToNode(from_index)][manager.IndexToNode(to_index)]
-    
+
     # Callback para tiempo ajustado con penalización por prioridad
     def time_with_priority_callback(from_index, to_index) -> int:
         from_node = manager.IndexToNode(from_index)
@@ -218,7 +214,7 @@ def optimize_route_logic(request: RouteRequest) -> Dict[str, Any]:
         priority  = prio_map.get(request.locations[to_node].priority, 0.0)
         penalty   = int(priority * PENALTY_FACTOR)
         return base_tt + penalty
-    
+
     distance_callback_index = routing.RegisterTransitCallback(distance_callback)
     #time_prio_cb_index  = routing.RegisterTransitCallback(time_with_priority_callback)
     time_callback_index     = routing.RegisterTransitCallback(time_prio_lookup)
@@ -227,11 +223,11 @@ def optimize_route_logic(request: RouteRequest) -> Dict[str, Any]:
         routing.SetArcCostEvaluatorOfAllVehicles(distance_callback_index)
     else:
         routing.SetArcCostEvaluatorOfAllVehicles(time_callback_index)'''
-    
+
     if request.optimize_by.lower() == "distance":
         routing.SetArcCostEvaluatorOfAllVehicles(distance_callback_index)
     else:
-        routing.SetArcCostEvaluatorOfAllVehicles(time_callback_index)    
+        routing.SetArcCostEvaluatorOfAllVehicles(time_callback_index)
 
     time_name = "Time"
     horizon = 500_000
@@ -241,12 +237,7 @@ def optimize_route_logic(request: RouteRequest) -> Dict[str, Any]:
     time_dimension = routing.GetDimensionOrDie(time_name)
 
     # Definimos las ventanas por prioridad (inician en 0 siempre, y terminan antes según nivel)
-    prio_to_tw = {
-        "alta":  (0, 2 * 3600),  # prioridad alta: entregar idealmente en primeras 2 horas
-        "media": (0, 4 * 3600),  # prioridad media: dentro de las primeras 4 horas
-        "baja":  (0, horizon)    # prioridad baja: cualquier hora hasta el cierre
-    }
-    
+
     for i, loc in enumerate(request.locations):
         if loc.time_window:
             # impongo la ventana sobre el nodo real, no sobre End(0)
@@ -257,7 +248,7 @@ def optimize_route_logic(request: RouteRequest) -> Dict[str, Any]:
     for idx in range(routing.Size()):
         routing.AddVariableMinimizedByFinalizer(
             time_dimension.SlackVar(idx))
-        
+
     # 2.2. Callback para la demanda (peso/volumen)
     demands = [loc.demand for loc in request.locations]
     def demand_callback(from_index):
@@ -276,7 +267,7 @@ def optimize_route_logic(request: RouteRequest) -> Dict[str, Any]:
         "Capacity"
     )'''
     # ------------------------------------------------------------------------------------
-    
+
     search_parameters = pywrapcp.DefaultRoutingSearchParameters()
     search_parameters.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
     search_parameters.log_search = True
@@ -290,7 +281,7 @@ def optimize_route_logic(request: RouteRequest) -> Dict[str, Any]:
 
     if not solution:
         raise HTTPException(status_code=400, detail="No se encontró una solución factible.")
-    
+
     # Recorrer cada vehículo para armar su ruta
     all_routes = []
     eta_results = []
@@ -416,7 +407,7 @@ def optimize_route_logic(request: RouteRequest) -> Dict[str, Any]:
             "vehicle_duration": vehicle_duration,
         })
 
-    # 3. Finalmente, devolvemos la respuesta completa. 
+    # 3. Finalmente, devolvemos la respuesta completa.
     # En lugar de un único optimized_route, retornamos la lista 'all_route_infos'
     return {
         "locations": [loc.dict() for loc in request.locations],
@@ -427,7 +418,7 @@ def optimize_route_logic(request: RouteRequest) -> Dict[str, Any]:
         "truck_parameters": [truck.dict() for truck in request.trucks],
     }
 
-def merge_responses(responses: List[RouteResponse]) -> RouteResponse:
+def merge_responses(responses: list[RouteResponse]) -> RouteResponse:
     """
     Combina múltiples RouteResponse en una sola.
     """
@@ -450,6 +441,7 @@ def merge_responses(responses: List[RouteResponse]) -> RouteResponse:
     )
 
 def optimize_with_kmeans_capacity(request: RouteRequest) -> RouteResponse:
+    """Agrupa ubicaciones por demanda y optimiza cada cluster por separado."""
 
     # -----------------------------------------------------------
     # 0. Preprocesamiento DBSCAN (Opción A)
@@ -462,15 +454,15 @@ def optimize_with_kmeans_capacity(request: RouteRequest) -> RouteResponse:
         model = DBSCAN(eps=request.dbscan_eps, min_samples=request.dbscan_min_samples, metric='haversine')
         labels = model.fit_predict(coords_rad)
         # Agrupamos índices y ruido
-        db_clusters: Dict[int, List[int]] = {}
-        noise_idx: List[int] = []
+        db_clusters: dict[int, list[int]] = {}
+        noise_idx: list[int] = []
         for idx, lbl in enumerate(labels):
             if lbl == -1:
                 noise_idx.append(idx)
             else:
                 db_clusters.setdefault(lbl, []).append(idx)
         # Llamadas recursivas por cada cluster y ruido
-        responses: List[RouteResponse] = []
+        responses: list[RouteResponse] = []
         for indices in db_clusters.values():
             sub_req = request.copy(update={
                 'locations': [request.locations[i] for i in indices],
@@ -490,7 +482,7 @@ def optimize_with_kmeans_capacity(request: RouteRequest) -> RouteResponse:
     # -----------------------------------------------------------
     for loc in request.locations:
         # 1.a. Peso físico:
-        peso_real = loc.weight_kg  
+        peso_real = loc.weight_kg
         # 1.b. Peso volumétrico equivalente:
         peso_volum = loc.volume_m3 * FACTOR_VOLUM_TO_KG
         # 1.c. Asignamos el demand como el mayor:
@@ -537,7 +529,7 @@ def optimize_with_kmeans_capacity(request: RouteRequest) -> RouteResponse:
     prio_feat = prio_n * W_prio
     #X = np.stack([lon_n, lat_n, dem_n, prio_feat], axis=1)'''
 
-    X = np.stack([lon_n, lat_n, dem_n], axis=1)  # (n,3)   
+    X = np.stack([lon_n, lat_n, dem_n], axis=1)  # (n,3)
 
     km     = KMeans(n_clusters=k, random_state=42)
     labels = km.fit_predict(X)
@@ -563,12 +555,12 @@ def optimize_with_kmeans_capacity(request: RouteRequest) -> RouteResponse:
         sub_labels = KMeans(n_clusters=2, random_state=0).fit_predict(subcoords)
         A = [idxs[i] for i in range(len(idxs)) if sub_labels[i] == 0]
         B = [idxs[i] for i in range(len(idxs)) if sub_labels[i] == 1]
-        return split_if_over_capacity(A, cap) + split_if_over_capacity(B, cap)                
+        return split_if_over_capacity(A, cap) + split_if_over_capacity(B, cap)
 
     # -----------------------------------------------------------
     # 3. Dividir recursivamente si un cluster excede capacidad
     # -----------------------------------------------------------
-    def split_cluster_if_overflow(cluster_indices: List[int], truck_capacity: float) -> List[List[int]]:
+    def split_cluster_if_overflow(cluster_indices: list[int], truck_capacity: float) -> list[list[int]]:
         """
         Si la suma de loc.demand en cluster_indices > truck_capacity,
         dividimos en 2 subclusters con KMeans y llamamos recursivamente.
@@ -588,7 +580,7 @@ def optimize_with_kmeans_capacity(request: RouteRequest) -> RouteResponse:
         return split_cluster_if_overflow(cluster_A, truck_capacity) + split_cluster_if_overflow(cluster_B, truck_capacity)
 
     # 3.a. Para cada cluster preliminar, si su suma de demanda > capacidad, subdividir:
-    final_clusters: List[List[int]] = []
+    final_clusters: list[list[int]] = []
     for cid, indices in prelim_clusters.items():
         cap_camion = request.trucks[cid].capacity
         sub_clusts = split_if_over_capacity(indices, cap_camion)
@@ -612,7 +604,7 @@ def optimize_with_kmeans_capacity(request: RouteRequest) -> RouteResponse:
     print("=== FINAL_CLUSTERS (DESPUÉS DE SPLIT) ===")
     for i, indices in enumerate(final_clusters):
         suma_i = sum(request.locations[j].demand for j in indices)
-        print(f"  * final_cluster {i}: índices {indices}, demanda total = {suma_i:.1f}")        
+        print(f"  * final_cluster {i}: índices {indices}, demanda total = {suma_i:.1f}")
 
     # -----------------------------------------------------------
     # 4. Ajustar número de camiones si hay más clusters que trucks
@@ -654,12 +646,12 @@ def optimize_with_kmeans_capacity(request: RouteRequest) -> RouteResponse:
     # -----------------------------------------------------------
     # 6. Para cada subcluster final, resolvemos (o creamos ruta trivial si solo 1 punto)
     # -----------------------------------------------------------
-    merged_locations: List[Dict] = []
-    merged_routes: List[Dict] = []
-    merged_etas: List[Dict] = []
+    merged_locations: list[dict] = []
+    merged_routes: list[dict] = []
+    merged_etas: list[dict] = []
     total_distance = 0.0
     total_duration = 0.0
-    merged_truck_params: List[Dict] = []
+    merged_truck_params: list[dict] = []
 
     for i, indices in enumerate(final_clusters):
         if not indices:
@@ -736,7 +728,7 @@ def optimize_with_kmeans_capacity(request: RouteRequest) -> RouteResponse:
                 }
                 merged_routes.append(ruta_simple)
 
-                # ETA    
+                # ETA
                 eta_simple = {
                     "vehicle_id": sub_truck.id,
                     "point": indices[0],
@@ -855,13 +847,13 @@ def optimize_with_kmeans_capacity(request: RouteRequest) -> RouteResponse:
         try:
             #print(f"Cluster {i}")
             #print en json mini_req
-            #print(f"  * mini_req: {mini_req}") 
+            #print(f"  * mini_req: {mini_req}")
             #print(f"Fin Cluster {i}")
             sub_resp = optimize_route_logic(mini_req)
-        except Exception as e:            
+        except Exception as e:
             print(f"[Aviso] Cluster {i} falló al optimizar: {e}")
             #print en json mini_req
-            print(f"  * mini_req: {mini_req}")            
+            print(f"  * mini_req: {mini_req}")
             continue
 
         # Combinar rutas (fold local→global)…
