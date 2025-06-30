@@ -33,7 +33,7 @@ end
 # Unset irrelevant variables.
 deactivate nondestructive
 
-set -gx VIRTUAL_ENV 'D:\AppDevops\Dinet.Route.Service\app'
+set -gx VIRTUAL_ENV 'D:\AppDevops\Upn.Route.Service\app'
 
 set -gx _OLD_VIRTUAL_PATH $PATH
 set -gx PATH "$VIRTUAL_ENV/"Scripts $PATH
